@@ -1,0 +1,563 @@
+/*
+  ESP8266 8-Channel Relay Scheduler
+  - Connects to Wi-Fi (uses WiFiManager for easy provisioning)
+  - Syncs time via NTP
+  - 8 relays, each supports up to 8 independent schedules
+  - Schedules and timezone are saved to LittleFS in /schedules.json
+  - Small web UI + JSON REST API to view/edit schedules
+
+  Required libraries (Install via Library Manager):
+  - ESP8266WiFi
+  - ESP8266WebServer
+  - LittleFS (ESP8266 LittleFS by lorol)
+  - WiFiManager (tzapu/WiFiManager)
+  - NTPClient
+  - ArduinoJson (v6)
+
+  Hardware notes:
+  - Change relayPins[] to match your wiring.
+  - Beware of using GPIO0, GPIO2, GPIO15, RX/TX and other boot-critical pins for relays without checking boot behavior.
+  - Many relay boards are active LOW. Set RELAY_ACTIVE_LOW accordingly.
+
+  JSON storage format (schedules.json):
+  {
+    "timezone_offset_minutes": 0,
+    "relays": [
+      { "schedules": [ { "enabled": true, "days": 127, "start": "08:00", "end": "10:00" }, ... up to 8 ... ] },
+      ... 8 relays total ...
+    ]
+  }
+*/
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <LittleFS.h>
+#include <WiFiManager.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <ArduinoJson.h>
+
+#define RELAY_COUNT 8
+#define SCHEDULES_PER_RELAY 8
+
+// Adjust these pins to your wiring. See hardware notes above.
+uint8_t relayPins[RELAY_COUNT] = {
+  5,  // D1 (GPIO5)
+  4,  // D2 (GPIO4)
+  14, // D5 (GPIO14)
+  12, // D6 (GPIO12)
+  13, // D7 (GPIO13)
+  15, // D8 (GPIO15) -- boot-critical for some boards, ensure board wiring supports this
+  16, // D0 (GPIO16) -- limited functionality on some modules
+  2   // D4 (GPIO2)  -- boot-critical for some boards
+};
+
+// If your relay module is active LOW (most modules), set to true
+const bool RELAY_ACTIVE_LOW = true;
+const int NTP_UPDATE_INTERVAL_MS = 60000; // 1 minute
+
+ESP8266WebServer server(80);
+WiFiUDP wifiUdp;
+NTPClient ntpClient(wifiUdp, "pool.ntp.org", 0, NTP_UPDATE_INTERVAL_MS);
+
+// Internal runtime state
+bool relayState[RELAY_COUNT] = {false};
+int timezoneOffsetMinutes = 0; // local timezone offset from UTC in minutes
+
+const char *SCHEDULES_PATH = "/schedules.json";
+
+// Helper: convert bool -> output value considering active-low modules
+inline int relayOutputValue(bool on) {
+  return RELAY_ACTIVE_LOW ? LOW : HIGH;
+}
+
+// Data structures for runtime (mirrors JSON)
+struct Schedule {
+  bool enabled;
+  uint8_t days; // bitmask: bit0=Sun, bit1=Mon, ... bit6=Sat
+  uint16_t startMinutes; // minutes since midnight
+  uint16_t endMinutes;   // minutes since midnight
+};
+
+Schedule schedules[RELAY_COUNT][SCHEDULES_PER_RELAY];
+
+// Utility functions
+uint16_t hhmmToMinutes(const String &hhmm) {
+  int colon = hhmm.indexOf(':');
+  if (colon < 0) return 0;
+  int h = hhmm.substring(0, colon).toInt();
+  int m = hhmm.substring(colon + 1).toInt();
+  return (uint16_t)(h * 60 + m);
+}
+
+String minutesToHHMM(uint16_t minutes) {
+  int h = minutes / 60;
+  int m = minutes % 60;
+  char buf[6];
+  sprintf(buf, "%02d:%02d", h, m);
+  return String(buf);
+}
+
+// Load schedules.json from LittleFS, or create defaults if not present or invalid
+void loadSchedules() {
+  if (!LittleFS.begin()) {
+    Serial.println("LittleFS mount failed - schedules will use defaults in RAM (not persistent).");
+    // initialize defaults
+    for (int r = 0; r < RELAY_COUNT; ++r) {
+      for (int s = 0; s < SCHEDULES_PER_RELAY; ++s) {
+        schedules[r][s] = {false, 0, 0, 0};
+      }
+    }
+    return;
+  }
+
+  if (!LittleFS.exists(SCHEDULES_PATH)) {
+    Serial.println("No schedules file found. Creating defaults.");
+    for (int r = 0; r < RELAY_COUNT; ++r) {
+      for (int s = 0; s < SCHEDULES_PER_RELAY; ++s) {
+        schedules[r][s] = {false, 0, 0, 0};
+      }
+    }
+    // save default file
+    // (we call saveSchedules below)
+    return;
+  }
+
+  File f = LittleFS.open(SCHEDULES_PATH, "r");
+  if (!f) {
+    Serial.println("Failed to open schedules file for reading.");
+    return;
+  }
+
+  size_t size = f.size();
+  std::unique_ptr<char[]> buf(new char[size + 1]);
+  f.readBytes(buf.get(), size);
+  buf[size] = 0;
+  f.close();
+
+  StaticJsonDocument<8192> doc; // should be enough for our structure
+  DeserializationError err = deserializeJson(doc, buf.get());
+  if (err) {
+    Serial.print("Failed to parse schedules.json: ");
+    Serial.println(err.c_str());
+    // fallback: defaults
+    for (int r = 0; r < RELAY_COUNT; ++r) {
+      for (int s = 0; s < SCHEDULES_PER_RELAY; ++s) {
+        schedules[r][s] = {false, 0, 0, 0};
+      }
+    }
+    return;
+  }
+
+  if (doc.containsKey("timezone_offset_minutes")) {
+    timezoneOffsetMinutes = doc["timezone_offset_minutes"].as<int>();
+  }
+
+  JsonArray relays = doc["relays"].as<JsonArray>();
+  int rIndex = 0;
+  for (JsonVariant rv : relays) {
+    if (rIndex >= RELAY_COUNT) break;
+    JsonArray arr = rv["schedules"].as<JsonArray>();
+    int sIndex = 0;
+    for (JsonVariant sv : arr) {
+      if (sIndex >= SCHEDULES_PER_RELAY) break;
+      bool enabled = sv["enabled"] | false;
+      int days = sv["days"] | 0;
+      const char* start = sv["start"] | "00:00";
+      const char* end = sv["end"] | "00:00";
+      schedules[rIndex][sIndex].enabled = enabled;
+      schedules[rIndex][sIndex].days = (uint8_t)days;
+      schedules[rIndex][sIndex].startMinutes = hhmmToMinutes(String(start));
+      schedules[rIndex][sIndex].endMinutes = hhmmToMinutes(String(end));
+      sIndex++;
+    }
+    // fill remaining with defaults
+    for (; sIndex < SCHEDULES_PER_RELAY; ++sIndex) {
+      schedules[rIndex][sIndex] = {false, 0, 0, 0};
+    }
+    rIndex++;
+  }
+  // fill any remaining relays
+  for (; rIndex < RELAY_COUNT; ++rIndex) {
+    for (int s = 0; s < SCHEDULES_PER_RELAY; ++s) schedules[rIndex][s] = {false, 0, 0, 0};
+  }
+
+  Serial.println("Schedules loaded from LittleFS.");
+}
+
+// Save schedules and timezone to LittleFS
+void saveSchedules() {
+  StaticJsonDocument<8192> doc;
+  doc["timezone_offset_minutes"] = timezoneOffsetMinutes;
+  JsonArray relays = doc.createNestedArray("relays");
+  for (int r = 0; r < RELAY_COUNT; ++r) {
+    JsonObject rObj = relays.createNestedObject();
+    JsonArray arr = rObj.createNestedArray("schedules");
+    for (int s = 0; s < SCHEDULES_PER_RELAY; ++s) {
+      JsonObject so = arr.createNestedObject();
+      so["enabled"] = schedules[r][s].enabled;
+      so["days"] = schedules[r][s].days;
+      so["start"] = minutesToHHMM(schedules[r][s].startMinutes);
+      so["end"] = minutesToHHMM(schedules[r][s].endMinutes);
+    }
+  }
+  File f = LittleFS.open(SCHEDULES_PATH, "w");
+  if (!f) {
+    Serial.println("Failed to open schedules file for writing.");
+    return;
+  }
+  if (serializeJsonPretty(doc, f) == 0) {
+    Serial.println("Failed to write schedules to file.");
+  } else {
+    Serial.println("Schedules saved to LittleFS.");
+  }
+  f.close();
+}
+
+// Evaluate schedules and set relay outputs accordingly
+void evaluateSchedulesAndApply(time_t epochUtc) {
+  // Apply timezone
+  time_t localEpoch = epochUtc + timezoneOffsetMinutes * 60;
+  struct tm *tm = gmtime(&localEpoch); // using gmtime on adjusted epoch yields local broken-down time
+  int wday = tm->tm_wday; // 0=Sun..6=Sat
+  int nowMinutes = tm->tm_hour * 60 + tm->tm_min;
+
+  for (int r = 0; r < RELAY_COUNT; ++r) {
+    bool shouldBeOn = false;
+    for (int s = 0; s < SCHEDULES_PER_RELAY; ++s) {
+      Schedule &sc = schedules[r][s];
+      if (!sc.enabled) continue;
+      if ((sc.days & (1 << wday)) == 0) continue; // day doesn't match
+      if (sc.startMinutes == sc.endMinutes) {
+        // treat as whole day (if start==end and enabled)
+        shouldBeOn = true;
+        break;
+      }
+      if (sc.startMinutes < sc.endMinutes) {
+        // simple same-day interval
+        if (nowMinutes >= sc.startMinutes && nowMinutes < sc.endMinutes) {
+          shouldBeOn = true;
+          break;
+        }
+      } else {
+        // overnight interval (e.g., 23:00 - 02:00)
+        if (nowMinutes >= sc.startMinutes || nowMinutes < sc.endMinutes) {
+          shouldBeOn = true;
+          break;
+        }
+      }
+    }
+    relayState[r] = shouldBeOn;
+    digitalWrite(relayPins[r], relayOutputValue(shouldBeOn));
+  }
+}
+
+// Build and send the main web UI (simple single-page app)
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ESP8266 Relay Scheduler</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 12px; }
+    .relay { border: 1px solid #ddd; padding: 8px; margin-bottom: 8px; }
+    .sched { margin-bottom: 4px; }
+    label { display:inline-block; width:90px; }
+    input[type=time] { width:110px; }
+    .on { color: green; font-weight: bold; }
+    .off { color: #888; }
+    button { margin-left:4px; }
+  </style>
+</head>
+<body>
+  <h2>ESP8266 Relay Scheduler</h2>
+  <div>
+    <div>Current time: <span id="time">--:--</span> (<span id="tz">UTC</span>)</div>
+    <div>Wi-Fi: <span id="wifi">...</span></div>
+  </div>
+  <div id="relays"></div>
+
+  <h3>Timezone / Settings</h3>
+  <div>
+    <label>Offset (min):</label><input id="tzoffset" type="number" step="15" /> <button onclick="saveTz()">Save</button>
+    <small>(minutes from UTC, e.g., -300 for UTC-5)</small>
+  </div>
+
+<script>
+async function getStatus() {
+  const r = await fetch('/api/status');
+  const j = await r.json();
+  document.getElementById('time').textContent = j.time_str;
+  document.getElementById('tz').textContent = 'UTC' + (j.timezone_offset_minutes >= 0 ? '+'+j.timezone_offset_minutes : j.timezone_offset_minutes);
+  document.getElementById('wifi').textContent = j.wifi_ssid ? j.wifi_ssid : 'disconnected';
+  document.getElementById('tzoffset').value = j.timezone_offset_minutes;
+  renderRelays(j.relays, j.relay_states);
+}
+
+function dayMaskToStr(mask) {
+  const names = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const out=[];
+  for (let i=0;i<7;i++) if (mask & (1<<i)) out.push(names[i]);
+  return out.length ? out.join(',') : '—';
+}
+
+function renderRelays(relays, states) {
+  const container = document.getElementById('relays');
+  container.innerHTML = '';
+  relays.forEach((r, idx) => {
+    const div = document.createElement('div');
+    div.className='relay';
+    const header = document.createElement('div');
+    header.innerHTML = `<strong>Relay ${idx+1}</strong> — State: <span class="${states[idx] ? 'on':'off'}">${states[idx] ? 'ON':'OFF'}</span>`;
+    div.appendChild(header);
+    r.schedules.forEach((s, si) => {
+      const sdiv = document.createElement('div');
+      sdiv.className='sched';
+      sdiv.innerHTML = `
+        <input type="checkbox" id="e_${idx}_${si}" ${s.enabled ? 'checked':''} />
+        <label for="e_${idx}_${si}">Enabled</label>
+        <label>Days</label><input id="d_${idx}_${si}" type="text" value="${dayMaskToStr(s.days)}" />
+        <label>Start</label><input id="st_${idx}_${si}" type="time" value="${s.start}" />
+        <label>End</label><input id="en_${idx}_${si}" type="time" value="${s.end}" />
+        <button onclick="saveOne(${idx},${si})">Save</button>
+      `;
+      div.appendChild(sdiv);
+    });
+    container.appendChild(div);
+  });
+}
+
+async function saveOne(relayIdx, schedIdx) {
+  const enabled = document.getElementById(`e_${relayIdx}_${schedIdx}`).checked;
+  const start = document.getElementById(`st_${relayIdx}_${schedIdx}`).value || '00:00';
+  const end = document.getElementById(`en_${relayIdx}_${schedIdx}`).value || '00:00';
+  // days field accepts 'Sun,Mon' or numbers 0-6; simple parsing here: if empty -> 0
+  const daysTxt = document.getElementById(`d_${relayIdx}_${schedIdx}`).value.trim();
+  let daysMask = 0;
+  if (daysTxt.length) {
+    const mapping = {'Sun':0,'Mon':1,'Tue':2,'Wed':3,'Thu':4,'Fri':5,'Sat':6};
+    daysTxt.split(',').forEach(p => {
+      const t = p.trim();
+      if (!t) return;
+      if (!isNaN(parseInt(t))) {
+        const v=parseInt(t);
+        if (v>=0 && v<=6) daysMask |= (1<<v);
+      } else {
+        const key = t.substring(0,3);
+        if (mapping[key] !== undefined) daysMask |= (1<<mapping[key]);
+      }
+    });
+  }
+  // Fetch current schedules, modify one element, then save entire file
+  const r = await fetch('/api/schedules'); const j = await r.json();
+  j.relays[relayIdx].schedules[schedIdx].enabled = enabled;
+  j.relays[relayIdx].schedules[schedIdx].start = start;
+  j.relays[relayIdx].schedules[schedIdx].end = end;
+  j.relays[relayIdx].schedules[schedIdx].days = daysMask;
+  const res = await fetch('/api/schedules', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(j) });
+  if (res.ok) {
+    alert('Saved schedule');
+    getStatus();
+  } else alert('Error saving');
+}
+
+async function saveTz() {
+  const off = parseInt(document.getElementById('tzoffset').value || '0');
+  const res = await fetch('/api/timezone', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({timezone_offset_minutes: off})});
+  if (res.ok) {
+    alert('Timezone saved');
+    getStatus();
+  } else alert('Error saving timezone');
+}
+
+setInterval(getStatus, 5000);
+getStatus();
+</script>
+</body>
+</html>
+)rawliteral";
+
+// API endpoints
+
+// GET /api/status -> JSON: time_str, timezone_offset_minutes, wifi_ssid, relay_states[], relays[]
+void handleApiStatus() {
+  // Build JSON status
+  StaticJsonDocument<2048> doc;
+  // Time
+  unsigned long epoch = ntpClient.getEpochTime();
+  time_t local = epoch + timezoneOffsetMinutes * 60;
+  struct tm *tm = gmtime(&local);
+  char buf[64];
+  sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d", tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec);
+  doc["time_str"] = buf;
+  doc["timezone_offset_minutes"] = timezoneOffsetMinutes;
+  doc["wifi_ssid"] = WiFi.SSID();
+  JsonArray states = doc.createNestedArray("relay_states");
+  for (int r = 0; r < RELAY_COUNT; ++r) states.add(relayState[r]);
+  JsonArray relays = doc.createNestedArray("relays");
+  for (int r = 0; r < RELAY_COUNT; ++r) {
+    JsonObject ro = relays.createNestedObject();
+    JsonArray arr = ro.createNestedArray("schedules");
+    for (int s = 0; s < SCHEDULES_PER_RELAY; ++s) {
+      JsonObject so = arr.createNestedObject();
+      so["enabled"] = schedules[r][s].enabled;
+      so["days"] = schedules[r][s].days;
+      so["start"] = minutesToHHMM(schedules[r][s].startMinutes);
+      so["end"] = minutesToHHMM(schedules[r][s].endMinutes);
+    }
+  }
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+// GET /api/schedules -> return schedules.json content
+void handleGetSchedules() {
+  if (!LittleFS.exists(SCHEDULES_PATH)) {
+    server.send(404, "application/json", "{\"error\":\"no schedules stored\"}");
+    return;
+  }
+  File f = LittleFS.open(SCHEDULES_PATH, "r");
+  if (!f) { server.send(500, "text/plain", "failed to open file"); return; }
+  String body = f.readString();
+  f.close();
+  server.send(200, "application/json", body);
+}
+
+// POST /api/schedules -> replace schedules.json (expect full JSON structure)
+void handlePostSchedules() {
+  if (server.args() == 0) {
+    server.send(400, "application/json", "{\"error\":\"no body\"}");
+    return;
+  }
+  String body = server.arg("plain");
+  StaticJsonDocument<8192> doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    server.send(400, "application/json", String("{\"error\":\"invalid json: ") + err.c_str() + "\"}");
+    return;
+  }
+  // validate and update runtime structures
+  if (doc.containsKey("timezone_offset_minutes")) {
+    timezoneOffsetMinutes = doc["timezone_offset_minutes"].as<int>();
+  }
+  if (!doc.containsKey("relays")) {
+    server.send(400, "application/json", "{\"error\":\"missing relays\"}");
+    return;
+  }
+  JsonArray relays = doc["relays"].as<JsonArray>();
+  int rIndex = 0;
+  for (JsonVariant rv : relays) {
+    if (rIndex >= RELAY_COUNT) break;
+    JsonArray arr = rv["schedules"].as<JsonArray>();
+    int sIndex = 0;
+    for (JsonVariant sv : arr) {
+      if (sIndex >= SCHEDULES_PER_RELAY) break;
+      bool enabled = sv["enabled"] | false;
+      int days = sv["days"] | 0;
+      const char* start = sv["start"] | "00:00";
+      const char* end = sv["end"] | "00:00";
+      schedules[rIndex][sIndex].enabled = enabled;
+      schedules[rIndex][sIndex].days = (uint8_t)days;
+      schedules[rIndex][sIndex].startMinutes = hhmmToMinutes(String(start));
+      schedules[rIndex][sIndex].endMinutes = hhmmToMinutes(String(end));
+      sIndex++;
+    }
+    // fill remaining
+    for (; sIndex < SCHEDULES_PER_RELAY; ++sIndex) schedules[rIndex][sIndex] = {false,0,0,0};
+    rIndex++;
+  }
+  for (; rIndex < RELAY_COUNT; ++rIndex) for (int s=0;s<SCHEDULES_PER_RELAY;++s) schedules[rIndex][s] = {false,0,0,0};
+
+  // persist
+  saveSchedules();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// POST /api/timezone -> { "timezone_offset_minutes": -300 }
+void handlePostTimezone() {
+  if (server.args() == 0) {
+    server.send(400, "application/json", "{\"error\":\"no body\"}");
+    return;
+  }
+  String body = server.arg("plain");
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) { server.send(400, "application/json", "{\"error\":\"invalid json\"}"); return; }
+  if (!doc.containsKey("timezone_offset_minutes")) { server.send(400, "application/json", "{\"error\":\"missing timezone_offset_minutes\"}"); return; }
+  timezoneOffsetMinutes = doc["timezone_offset_minutes"].as<int>();
+  saveSchedules();
+  // update NTP client offset (NTPClient offset is seconds)
+  ntpClient.setTimeOffset(0); // we handle timezone ourselves; keep ntpClient in UTC
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// Serve index
+void handleRoot() {
+  server.send_P(200, "text/html", index_html);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println();
+  Serial.println("ESP8266 Relay Scheduler starting...");
+
+  // init relay pins
+  for (int i = 0; i < RELAY_COUNT; ++i) {
+    pinMode(relayPins[i], OUTPUT);
+    digitalWrite(relayPins[i], RELAY_ACTIVE_LOW ? HIGH : LOW); // ensure off at boot
+    relayState[i] = false;
+  }
+
+  // Mount LittleFS and load schedules
+  if (!LittleFS.begin()) {
+    Serial.println("LittleFS mount failed. Schedules will not be persistent.");
+  }
+  loadSchedules(); // loads schedules[] and timezoneOffsetMinutes (if present)
+  // Make sure we save defaults if file didn't exist
+  saveSchedules();
+
+  // WiFi provisioning using WiFiManager (starts AP if no saved credentials)
+  WiFiManager wm;
+  // You can customize portal SSID/password by wm.startConfigPortal("MyAP");
+  if (!wm.autoConnect("RelaySchedulerAP")) {
+    Serial.println("Failed to connect and hit timeout, restarting...");
+    delay(3000);
+    ESP.restart();
+  }
+  Serial.print("Connected to WiFi: "); Serial.println(WiFi.SSID());
+  Serial.print("IP address: "); Serial.println(WiFi.localIP());
+
+  // Initialize NTP
+  // We'll let ntpClient keep UTC epoch; timezone handled by timezoneOffsetMinutes
+  ntpClient.begin();
+  ntpClient.setTimeOffset(0);
+
+  // Setup web server routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/status", HTTP_GET, handleApiStatus);
+  server.on("/api/schedules", HTTP_GET, handleGetSchedules);
+  server.on("/api/schedules", HTTP_POST, handlePostSchedules);
+  server.on("/api/timezone", HTTP_POST, handlePostTimezone);
+  server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
+  server.begin();
+  Serial.println("HTTP server started.");
+}
+
+unsigned long lastEvaluation = 0;
+unsigned long lastNtpUpdate = 0;
+
+void loop() {
+  server.handleClient();
+  // update NTP periodically (NTPClient does this internally every NTP_UPDATE_INTERVAL_MS)
+  ntpClient.update();
+
+  unsigned long now = millis();
+  // Evaluate schedules every 10 seconds or when minute changes
+  if (now - lastEvaluation >= 10000) {
+    unsigned long epoch = ntpClient.getEpochTime();
+    evaluateSchedulesAndApply(epoch);
+    lastEvaluation = now;
+  }
+}
