@@ -1,0 +1,125 @@
+name: Build ESP32 Firmware 
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Clone repository
+      run: |
+        git clone https://github.com/xiv3r/ESP8266-ESP32-8x8-relay-auto-switch
+        
+    - name: Install Arduino CLI
+      run: |
+        curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR=/usr/local/bin sh
+        arduino-cli version
+    
+    - name: Configure Arduino CLI
+      run: |
+        arduino-cli config init
+        # Add ESP32 board manager URL
+        arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+        arduino-cli core update-index
+    
+    - name: Install ESP32 core
+      run: |
+        arduino-cli core search esp32
+        arduino-cli core install esp32:esp32
+        arduino-cli core list
+    
+    - name: Install all required libraries
+      run: |
+        arduino-cli lib update-index
+        
+        # Communication & Data
+        arduino-cli lib install "ArduinoJson"
+        arduino-cli lib install "WiFiManager"
+        
+        arduino-cli lib list
+        
+    - name: Verify ESP32 core installation
+      run: |
+        echo "Checking installed cores:"
+        arduino-cli core list
+        echo "Checking available boards:"
+        arduino-cli board listall esp32
+        
+    - name: Compile .ino file
+      run: |
+        cd ESP8266-ESP32-8x8-relay-auto-switch
+        mkdir -p main
+        mv ESP32_Relay_Scheduler.ino main/main.ino
+        cd main
+
+        # Common ESP32 FQBN options:
+        # - esp32:esp32:esp32 (generic ESP32)
+        # - esp32:esp32:nodemcu-32s
+        # - esp32:esp32:esp32dev
+        # - esp32:esp32:esp32-s2
+        # - esp32:esp32:esp32-c3
+        # - esp32:esp32:esp32-s3
+        
+        arduino-cli compile --fqbn esp32:esp32:esp32 \
+          --output-dir ../output \
+          ./
+          
+    - name: Determine release tag
+      id: get_tag
+      run: |
+        if [ "${{ github.event_name }}" == "release" ]; then
+          TAG_NAME="${{ github.event.release.tag_name }}"
+        else
+          TAG_NAME="ESP32-firmware"
+        fi
+        echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+
+    - name: Delete existing release assets
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const { data: releases } = await github.rest.repos.listReleases({
+            owner: context.repo.owner,
+            repo: context.repo.repo
+          });
+          
+          const targetRelease = releases.find(release => release.tag_name === '${{ steps.get_tag.outputs.tag_name }}');
+          
+          if (targetRelease) {
+            console.log(`Found release with tag: ${{ steps.get_tag.outputs.tag_name }}`);
+            console.log(`Release ID: ${targetRelease.id}`);
+            
+            const { data: assets } = await github.rest.repos.listReleaseAssets({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: targetRelease.id
+            });
+            
+            console.log(`Found ${assets.length} assets to delete`);
+            
+            for (const asset of assets) {
+              console.log(`Deleting asset: ${asset.name} (ID: ${asset.id})`);
+              await github.rest.repos.deleteReleaseAsset({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                asset_id: asset.id
+              });
+            }
+            
+            console.log('All existing assets deleted');
+          } else {
+            console.log(`No release found with tag: ${{ steps.get_tag.outputs.tag_name }}`);
+          }
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Uploading files
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.get_tag.outputs.tag_name }}
+        files: |
+          ESP8266-ESP32-8x8-relay-auto-switch/output/*.bin
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
